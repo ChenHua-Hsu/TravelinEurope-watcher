@@ -1,0 +1,206 @@
+# Trip configuration — edit to add/change trips.
+# `locked: true` = fixed dates (don't reorder); `locked: false` = flexible window.
+# `watch_days_before: [min, max]` = only check fares when departure is in this window.
+# `baseline_discount_pct` = alert threshold vs rolling 30-day median.
+
+origin: GVA
+
+# Hard safety cap — watcher refuses to call Amadeus beyond this per calendar month.
+# Amadeus free tier is 2000; we set a lower cap so we stop well before it, and send
+# a WhatsApp warning at 80% and a hard-stop alert at 90%.
+monthly_request_cap: 1800
+warn_at_pct: 80
+stop_at_pct: 90
+
+trips:
+  # ============ YEAR 1 ============
+  - id: austria_slovakia_slovenia_2026_09
+    label: "Vienna conf + AT/SK/SI"
+    destinations: [VIE]
+    return_from: LJU
+    depart_window: [2026-09-19, 2026-09-19]
+    return_window: [2026-09-25, 2026-09-25]
+    locked: true
+    watch_days_before: [14, 120]
+    baseline_discount_pct: 15
+
+  - id: spain_2026_10
+    label: "Spain Madrid+Barcelona"
+    destinations: [MAD]
+    return_from: BCN
+    depart_window: [2026-10-22, 2026-10-22]
+    return_window: [2026-10-26, 2026-10-26]
+    locked: false
+    watch_days_before: [10, 90]
+    baseline_discount_pct: 20
+
+  - id: italy_2026_11
+    label: "Italy + Vatican + San Marino"
+    destinations: [FCO]
+    return_from: FCO
+    depart_window: [2026-11-19, 2026-11-19]
+    return_window: [2026-11-23, 2026-11-23]
+    locked: false
+    watch_days_before: [14, 90]
+    baseline_discount_pct: 20
+
+  - id: czech_hungary_2026_12
+    label: "Czech Christmas + Budapest NYE"
+    destinations: [PRG]
+    return_from: BUD
+    depart_window: [2026-12-22, 2026-12-22]
+    return_window: [2027-01-01, 2027-01-01]
+    locked: true
+    watch_days_before: [14, 180]
+    baseline_discount_pct: 15
+
+  - id: iceland_2027_01
+    label: "Iceland (aurora + ice caves)"
+    destinations: [KEF]
+    return_from: KEF
+    depart_window: [2027-01-14, 2027-01-14]
+    return_window: [2027-01-18, 2027-01-18]
+    locked: true
+    watch_days_before: [21, 180]
+    baseline_discount_pct: 15
+
+  - id: norway_2027_02
+    label: "Norway Tromsø aurora"
+    destinations: [TOS]
+    return_from: TOS
+    depart_window: [2027-02-18, 2027-02-18]
+    return_window: [2027-02-22, 2027-02-22]
+    locked: true
+    watch_days_before: [21, 180]
+    baseline_discount_pct: 15
+
+  - id: finland_2027_03
+    label: "Finland Lapland"
+    destinations: [RVN]
+    return_from: HEL
+    depart_window: [2027-03-18, 2027-03-18]
+    return_window: [2027-03-22, 2027-03-22]
+    locked: true
+    watch_days_before: [21, 180]
+    baseline_discount_pct: 15
+
+  - id: benelux_2027_04
+    label: "Benelux (tulip peak)"
+    destinations: [AMS]
+    return_from: LUX
+    depart_window: [2027-04-15, 2027-04-15]
+    return_window: [2027-04-20, 2027-04-20]
+    locked: true
+    watch_days_before: [21, 150]
+    baseline_discount_pct: 15
+
+  - id: denmark_sweden_2027_05
+    label: "Denmark + Sweden"
+    destinations: [CPH]
+    return_from: ARN
+    depart_window: [2027-05-20, 2027-05-20]
+    return_window: [2027-05-25, 2027-05-25]
+    locked: false
+    watch_days_before: [21, 120]
+    baseline_discount_pct: 20
+
+  - id: uk_2027_06
+    label: "UK (London + Edinburgh)"
+    destinations: [LHR]
+    return_from: EDI
+    depart_window: [2027-06-17, 2027-06-17]
+    return_window: [2027-06-21, 2027-06-21]
+    locked: false
+    watch_days_before: [21, 120]
+    baseline_discount_pct: 20
+
+  - id: baltics_2027_07
+    label: "Baltics (Tallinn→Riga→Vilnius)"
+    destinations: [TLL]
+    return_from: VNO
+    depart_window: [2027-07-15, 2027-07-15]
+    return_window: [2027-07-21, 2027-07-21]
+    locked: true
+    watch_days_before: [21, 180]
+    baseline_discount_pct: 15
+
+  # ============ YEAR 2 ============
+  - id: croatia_2027_09
+    label: "Croatia (Split→Dubrovnik)"
+    destinations: [SPU]
+    return_from: DBV
+    depart_window: [2027-09-16, 2027-09-16]
+    return_window: [2027-09-20, 2027-09-20]
+    locked: false
+    watch_days_before: [21, 150]
+    baseline_discount_pct: 20
+
+  - id: romania_bulgaria_2027_10
+    label: "Romania + Bulgaria"
+    destinations: [OTP]
+    return_from: SOF
+    depart_window: [2027-10-14, 2027-10-14]
+    return_window: [2027-10-18, 2027-10-18]
+    locked: false
+    watch_days_before: [21, 120]
+    baseline_discount_pct: 20
+
+  - id: turkey_2027_11
+    label: "Turkey (Istanbul + Cappadocia)"
+    destinations: [IST]
+    return_from: ASR
+    depart_window: [2027-11-11, 2027-11-11]
+    return_window: [2027-11-15, 2027-11-15]
+    locked: false
+    watch_days_before: [21, 150]
+    baseline_discount_pct: 20
+
+  - id: greece_2027_12
+    label: "Greece mainland"
+    destinations: [ATH]
+    return_from: ATH
+    depart_window: [2027-12-20, 2027-12-20]
+    return_window: [2027-12-29, 2027-12-29]
+    locked: true
+    watch_days_before: [21, 180]
+    baseline_discount_pct: 15
+
+  - id: portugal_2028_04
+    label: "Portugal (Lisbon + Porto)"
+    destinations: [LIS]
+    return_from: OPO
+    depart_window: [2028-04-13, 2028-04-13]
+    return_window: [2028-04-17, 2028-04-17]
+    locked: false
+    watch_days_before: [21, 150]
+    baseline_discount_pct: 20
+
+  - id: bosnia_montenegro_2028_05
+    label: "Bosnia + Montenegro"
+    destinations: [SJJ]
+    return_from: TIV
+    depart_window: [2028-05-18, 2028-05-18]
+    return_window: [2028-05-22, 2028-05-22]
+    locked: false
+    watch_days_before: [21, 120]
+    baseline_discount_pct: 20
+
+  - id: ireland_2028_06
+    label: "Ireland (Wild Atlantic Way)"
+    destinations: [DUB]
+    return_from: DUB
+    depart_window: [2028-06-15, 2028-06-15]
+    return_window: [2028-06-19, 2028-06-19]
+    locked: false
+    watch_days_before: [21, 120]
+    baseline_discount_pct: 20
+
+  - id: inner_balkans_2028_07
+    label: "Serbia + N.Macedonia + Albania"
+    destinations: [BEG]
+    return_from: TIA
+    depart_window: [2028-07-14, 2028-07-14]
+    return_window: [2028-07-23, 2028-07-23]
+    locked: true
+    watch_days_before: [21, 180]
+    baseline_discount_pct: 15

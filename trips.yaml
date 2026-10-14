@@ -1,16 +1,26 @@
-# Trip configuration — edit to add/change trips.
-# `locked: true` = fixed dates (don't reorder); `locked: false` = flexible window.
-# `watch_days_before: [min, max]` = only check fares when departure is in this window.
-# `baseline_discount_pct` = alert threshold vs rolling 30-day median.
+# Trip configuration.
+#
+# Schema:
+#   window_start / window_end: date range the scanner probes (inclusive).
+#       For flexible trips: ~1 month before plan to ~1 month after.
+#       For locked trips: narrow or single day.
+#   duration_days: trip length in days (depart on day D, return on day D + duration - 1).
+#   planned_depart: used in alerts for comparison ("Plan date: €X vs cheapest: €Y").
+#   locked: true = schedule is fixed, scanning is just for info; false = can swap dates.
+#   watch_days_before: [min, max] days before departure to actually scan.
+#   top_n_watch: how many cheapest dates to monitor daily between weekly full scans.
+#   baseline_discount_pct: alert on daily watch when a date drops this % below its last price.
 
 origin: GVA
 
-# Hard safety cap — watcher refuses to call Amadeus beyond this per calendar month.
-# Amadeus free tier is 2000; we set a lower cap so we stop well before it, and send
-# a WhatsApp warning at 80% and a hard-stop alert at 90%.
-monthly_request_cap: 1800
+# Safety cap: scrape count per month before the watcher auto-stops.
+# NOT a billing cap (nothing is billed) — just a bug circuit-breaker.
+monthly_request_cap: 10000
 warn_at_pct: 80
 stop_at_pct: 90
+
+# Number of cheapest dates per trip to monitor between weekly full scans.
+default_top_n_watch: 5
 
 trips:
   # ============ YEAR 1 ============
@@ -18,8 +28,10 @@ trips:
     label: "Vienna conf + AT/SK/SI"
     destinations: [VIE]
     return_from: LJU
-    depart_window: [2026-09-19, 2026-09-19]
-    return_window: [2026-09-25, 2026-09-25]
+    planned_depart: 2026-09-19
+    window_start: 2026-09-19
+    window_end: 2026-09-19
+    duration_days: 7
     locked: true
     watch_days_before: [14, 120]
     baseline_discount_pct: 15
@@ -28,48 +40,58 @@ trips:
     label: "Spain Madrid+Barcelona"
     destinations: [MAD]
     return_from: BCN
-    depart_window: [2026-10-22, 2026-10-22]
-    return_window: [2026-10-26, 2026-10-26]
+    planned_depart: 2026-10-22
+    window_start: 2026-09-07
+    window_end: 2026-12-07
+    duration_days: 5
     locked: false
     watch_days_before: [10, 90]
     baseline_discount_pct: 20
 
-  - id: italy_2026_11
+  - id: italy_2028_03
     label: "Italy + Vatican + San Marino"
     destinations: [FCO]
     return_from: FCO
-    depart_window: [2026-11-19, 2026-11-19]
-    return_window: [2026-11-23, 2026-11-23]
+    planned_depart: 2028-03-16
+    window_start: 2028-02-01
+    window_end: 2028-05-01
+    duration_days: 5
     locked: false
-    watch_days_before: [14, 90]
+    watch_days_before: [21, 150]
     baseline_discount_pct: 20
 
   - id: czech_hungary_2026_12
     label: "Czech Christmas + Budapest NYE"
     destinations: [PRG]
     return_from: BUD
-    depart_window: [2026-12-22, 2026-12-22]
-    return_window: [2027-01-01, 2027-01-01]
+    planned_depart: 2026-12-22
+    window_start: 2026-12-20
+    window_end: 2026-12-24
+    duration_days: 11
     locked: true
     watch_days_before: [14, 180]
     baseline_discount_pct: 15
 
-  - id: iceland_2027_01
+  - id: iceland_2028_01
     label: "Iceland (aurora + ice caves)"
     destinations: [KEF]
     return_from: KEF
-    depart_window: [2027-01-14, 2027-01-14]
-    return_window: [2027-01-18, 2027-01-18]
+    planned_depart: 2028-01-13
+    window_start: 2028-01-06
+    window_end: 2028-01-28
+    duration_days: 5
     locked: true
     watch_days_before: [21, 180]
     baseline_discount_pct: 15
 
-  - id: norway_2027_02
+  - id: norway_2028_02
     label: "Norway Tromsø aurora"
     destinations: [TOS]
     return_from: TOS
-    depart_window: [2027-02-18, 2027-02-18]
-    return_window: [2027-02-22, 2027-02-22]
+    planned_depart: 2028-02-17
+    window_start: 2028-02-03
+    window_end: 2028-02-28
+    duration_days: 5
     locked: true
     watch_days_before: [21, 180]
     baseline_discount_pct: 15
@@ -78,8 +100,10 @@ trips:
     label: "Finland Lapland"
     destinations: [RVN]
     return_from: HEL
-    depart_window: [2027-03-18, 2027-03-18]
-    return_window: [2027-03-22, 2027-03-22]
+    planned_depart: 2027-03-18
+    window_start: 2027-03-04
+    window_end: 2027-03-28
+    duration_days: 5
     locked: true
     watch_days_before: [21, 180]
     baseline_discount_pct: 15
@@ -88,8 +112,10 @@ trips:
     label: "Benelux (tulip peak)"
     destinations: [AMS]
     return_from: LUX
-    depart_window: [2027-04-15, 2027-04-15]
-    return_window: [2027-04-20, 2027-04-20]
+    planned_depart: 2027-04-15
+    window_start: 2027-04-08
+    window_end: 2027-04-25
+    duration_days: 6
     locked: true
     watch_days_before: [21, 150]
     baseline_discount_pct: 15
@@ -98,8 +124,10 @@ trips:
     label: "Denmark + Sweden"
     destinations: [CPH]
     return_from: ARN
-    depart_window: [2027-05-20, 2027-05-20]
-    return_window: [2027-05-25, 2027-05-25]
+    planned_depart: 2027-05-20
+    window_start: 2027-04-05
+    window_end: 2027-07-05
+    duration_days: 6
     locked: false
     watch_days_before: [21, 120]
     baseline_discount_pct: 20
@@ -108,8 +136,10 @@ trips:
     label: "UK (London + Edinburgh)"
     destinations: [LHR]
     return_from: EDI
-    depart_window: [2027-06-17, 2027-06-17]
-    return_window: [2027-06-21, 2027-06-21]
+    planned_depart: 2027-06-17
+    window_start: 2027-05-03
+    window_end: 2027-08-02
+    duration_days: 5
     locked: false
     watch_days_before: [21, 120]
     baseline_discount_pct: 20
@@ -118,8 +148,10 @@ trips:
     label: "Baltics (Tallinn→Riga→Vilnius)"
     destinations: [TLL]
     return_from: VNO
-    depart_window: [2027-07-15, 2027-07-15]
-    return_window: [2027-07-21, 2027-07-21]
+    planned_depart: 2027-07-15
+    window_start: 2027-07-05
+    window_end: 2027-07-30
+    duration_days: 7
     locked: true
     watch_days_before: [21, 180]
     baseline_discount_pct: 15
@@ -129,8 +161,10 @@ trips:
     label: "Croatia (Split→Dubrovnik)"
     destinations: [SPU]
     return_from: DBV
-    depart_window: [2027-09-16, 2027-09-16]
-    return_window: [2027-09-20, 2027-09-20]
+    planned_depart: 2027-09-16
+    window_start: 2027-08-02
+    window_end: 2027-11-01
+    duration_days: 5
     locked: false
     watch_days_before: [21, 150]
     baseline_discount_pct: 20
@@ -139,8 +173,10 @@ trips:
     label: "Romania + Bulgaria"
     destinations: [OTP]
     return_from: SOF
-    depart_window: [2027-10-14, 2027-10-14]
-    return_window: [2027-10-18, 2027-10-18]
+    planned_depart: 2027-10-14
+    window_start: 2027-08-30
+    window_end: 2027-11-29
+    duration_days: 5
     locked: false
     watch_days_before: [21, 120]
     baseline_discount_pct: 20
@@ -149,8 +185,10 @@ trips:
     label: "Turkey (Istanbul + Cappadocia)"
     destinations: [IST]
     return_from: ASR
-    depart_window: [2027-11-11, 2027-11-11]
-    return_window: [2027-11-15, 2027-11-15]
+    planned_depart: 2027-11-11
+    window_start: 2027-09-27
+    window_end: 2027-12-27
+    duration_days: 5
     locked: false
     watch_days_before: [21, 150]
     baseline_discount_pct: 20
@@ -159,8 +197,10 @@ trips:
     label: "Greece mainland"
     destinations: [ATH]
     return_from: ATH
-    depart_window: [2027-12-20, 2027-12-20]
-    return_window: [2027-12-29, 2027-12-29]
+    planned_depart: 2027-12-20
+    window_start: 2027-12-15
+    window_end: 2027-12-25
+    duration_days: 10
     locked: true
     watch_days_before: [21, 180]
     baseline_discount_pct: 15
@@ -169,8 +209,10 @@ trips:
     label: "Portugal (Lisbon + Porto)"
     destinations: [LIS]
     return_from: OPO
-    depart_window: [2028-04-13, 2028-04-13]
-    return_window: [2028-04-17, 2028-04-17]
+    planned_depart: 2028-04-13
+    window_start: 2028-02-27
+    window_end: 2028-05-28
+    duration_days: 5
     locked: false
     watch_days_before: [21, 150]
     baseline_discount_pct: 20
@@ -179,8 +221,10 @@ trips:
     label: "Bosnia + Montenegro"
     destinations: [SJJ]
     return_from: TIV
-    depart_window: [2028-05-18, 2028-05-18]
-    return_window: [2028-05-22, 2028-05-22]
+    planned_depart: 2028-05-18
+    window_start: 2028-04-03
+    window_end: 2028-07-03
+    duration_days: 5
     locked: false
     watch_days_before: [21, 120]
     baseline_discount_pct: 20
@@ -189,8 +233,10 @@ trips:
     label: "Ireland (Wild Atlantic Way)"
     destinations: [DUB]
     return_from: DUB
-    depart_window: [2028-06-15, 2028-06-15]
-    return_window: [2028-06-19, 2028-06-19]
+    planned_depart: 2028-06-15
+    window_start: 2028-05-01
+    window_end: 2028-07-31
+    duration_days: 5
     locked: false
     watch_days_before: [21, 120]
     baseline_discount_pct: 20
@@ -199,8 +245,10 @@ trips:
     label: "Serbia + N.Macedonia + Albania"
     destinations: [BEG]
     return_from: TIA
-    depart_window: [2028-07-14, 2028-07-14]
-    return_window: [2028-07-23, 2028-07-23]
+    planned_depart: 2028-07-14
+    window_start: 2028-07-05
+    window_end: 2028-07-30
+    duration_days: 10
     locked: true
     watch_days_before: [21, 180]
     baseline_discount_pct: 15

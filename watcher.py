@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
-"""Flight watcher — scans Google Flights via fast-flights for deals on trips.yaml,
-alerts via WhatsApp when a fare drops below the rolling 30-day median."""
+"""Flight watcher — two-tier scan over Google Flights via fast-flights.
+
+Modes:
+  --mode full   : scan every day in each trip's window, record all fares,
+                  cache the top-N cheapest, and send a weekly digest WhatsApp.
+  --mode watch  : scan ONLY the top-N dates cached from the last full scan,
+                  alert if any drops below its cached price by threshold.
+  --mode test   : run test_run.py's flow (unconditional 5-trip WhatsApp).
+"""
+import argparse
 import os
 import sqlite3
 import statistics
@@ -13,11 +21,10 @@ import requests
 import yaml
 from fast_flights import FlightQuery, Passengers, create_query, get_flights
 from fast_flights import fetcher as _ff_fetcher
-from fast_flights.fetcher import Client as _FFClient, URL as _FF_URL, parse as _ff_parse
+from fast_flights.fetcher import Client as _FFClient, URL as _FF_URL
 from fast_flights.querying import Query as _FFQuery
 
-# Bypass Google's EU GDPR consent wall by preseeding the CONSENT cookie.
-# Without this, European-IP requests get a consent page instead of the flights page.
+# EU GDPR consent-wall bypass: preseeded cookie so European IPs don't get the consent page.
 _CONSENT_COOKIES = {"CONSENT": "YES+cb", "SOCS": "CAISHAgBEhJnd3NfMjAyNDAxMDQtMF9SQzIaAmVuIAEaBgiA_LyvBg"}
 
 
@@ -38,9 +45,12 @@ def _patched_fetch_html(q, *, proxy=None, fetch_integration=None):
 
 _ff_fetcher.fetch_flights_html = _patched_fetch_html
 
+
 DB_PATH = "fares.db"
 TRIPS_PATH = "trips.yaml"
 
+
+# ─── Config & DB ────────────────────────────────────────────────────────────
 
 def load_config():
     return yaml.safe_load(Path(TRIPS_PATH).read_text())
@@ -52,26 +62,32 @@ def init_db():
         CREATE TABLE IF NOT EXISTS fares (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             trip_id TEXT NOT NULL,
-            origin TEXT NOT NULL,
-            dest TEXT NOT NULL,
             depart_date TEXT NOT NULL,
-            return_date TEXT,
+            return_date TEXT NOT NULL,
             price_eur REAL NOT NULL,
+            scan_mode TEXT NOT NULL,
             seen_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS top_dates (
+            trip_id TEXT NOT NULL,
+            depart_date TEXT NOT NULL,
+            return_date TEXT NOT NULL,
+            price_at_fullscan REAL NOT NULL,
+            computed_at TEXT NOT NULL,
+            PRIMARY KEY (trip_id, depart_date)
         )
     """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS alerts_sent (
             trip_id TEXT NOT NULL,
+            depart_date TEXT NOT NULL,
             price_eur REAL NOT NULL,
             sent_at TEXT NOT NULL
         )
     """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS api_calls (
-            called_at TEXT NOT NULL
-        )
-    """)
+    conn.execute("CREATE TABLE IF NOT EXISTS api_calls (called_at TEXT NOT NULL)")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS budget_alerts (
             month TEXT NOT NULL,
@@ -85,11 +101,10 @@ def init_db():
 
 
 def calls_this_month(conn):
-    first_of_month = date.today().replace(day=1).isoformat()
-    cur = conn.execute(
-        "SELECT COUNT(*) FROM api_calls WHERE called_at >= ?", (first_of_month,)
-    )
-    return cur.fetchone()[0]
+    first = date.today().replace(day=1).isoformat()
+    return conn.execute(
+        "SELECT COUNT(*) FROM api_calls WHERE called_at >= ?", (first,)
+    ).fetchone()[0]
 
 
 def log_call(conn):
@@ -100,51 +115,29 @@ def log_call(conn):
     conn.commit()
 
 
-def budget_alert_sent(conn, month, level):
-    cur = conn.execute(
-        "SELECT 1 FROM budget_alerts WHERE month = ? AND level = ?", (month, level)
-    )
-    return cur.fetchone() is not None
-
-
-def mark_budget_alert(conn, month, level):
-    conn.execute(
-        "INSERT OR REPLACE INTO budget_alerts (month, level, sent_at) VALUES (?, ?, ?)",
-        (month, level, datetime.utcnow().isoformat()),
-    )
-    conn.commit()
-
+# ─── Fare fetching ──────────────────────────────────────────────────────────
 
 class BudgetExceeded(Exception):
     pass
 
 
-def _parse_price(price_str):
-    """fast-flights returns prices like '€123' or '$140' — pull the number."""
-    if price_str is None:
+def _parse_price(p):
+    if p is None:
         return None
-    digits = "".join(c for c in str(price_str) if c.isdigit() or c == ".")
+    digits = "".join(c for c in str(p) if c.isdigit() or c == ".")
     try:
         return float(digits) if digits else None
     except ValueError:
         return None
 
 
-def search_fare(conn, cap, origin, dest, depart_date, return_date=None):
-    """Return cheapest total EUR price for a route, or None. Scrapes Google Flights."""
-    if calls_this_month(conn) >= cap:
-        raise BudgetExceeded(f"monthly cap {cap} reached — refusing to call API")
-    log_call(conn)
-
-    flights = [FlightQuery(date=depart_date, from_airport=origin, to_airport=dest)]
+def _query_cheapest(from_a, to_a, dep_date, return_date=None):
+    """One Google Flights query. Returns min price or None."""
+    flights = [FlightQuery(date=dep_date, from_airport=from_a, to_airport=to_a)]
+    trip_type = "one-way"
     if return_date:
-        flights.append(
-            FlightQuery(date=return_date, from_airport=dest, to_airport=origin)
-        )
+        flights.append(FlightQuery(date=return_date, from_airport=to_a, to_airport=from_a))
         trip_type = "round-trip"
-    else:
-        trip_type = "one-way"
-
     try:
         q = create_query(
             flights=flights,
@@ -155,34 +148,78 @@ def search_fare(conn, cap, origin, dest, depart_date, return_date=None):
         )
         result = get_flights(q)
         items = getattr(result, "flights", None) or list(result or [])
-        if not items:
-            return None
         prices = [_parse_price(getattr(f, "price", None)) for f in items]
         prices = [p for p in prices if p is not None]
         return min(prices) if prices else None
     except Exception as e:
-        print(f"  gflights error {origin}->{dest} {depart_date}: {e}", file=sys.stderr)
+        print(f"  gflights error {from_a}→{to_a} {dep_date}: {e}", file=sys.stderr)
         return None
 
 
-def rolling_baseline(conn, trip_id, days=30):
-    cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
-    cur = conn.execute(
-        "SELECT price_eur FROM fares WHERE trip_id = ? AND seen_at >= ?",
-        (trip_id, cutoff),
-    )
-    prices = [r[0] for r in cur.fetchall()]
-    return statistics.median(prices) if len(prices) >= 3 else None
+def search_pair(conn, cap, origin, dest, ret_from, depart, return_date):
+    """Fetch cheapest total EUR fare for one (depart, return) pair.
+    Round-trip = 1 API call, open-jaw = 2 (fast-flights multi-city parser is broken)."""
+    if calls_this_month(conn) >= cap:
+        raise BudgetExceeded(f"monthly cap {cap} reached")
+
+    if ret_from == dest:
+        log_call(conn)
+        return _query_cheapest(origin, dest, depart, return_date)
+
+    # Open-jaw: two one-ways summed
+    log_call(conn)
+    outb = _query_cheapest(origin, dest, depart)
+    if outb is None:
+        return None
+    if calls_this_month(conn) >= cap:
+        raise BudgetExceeded(f"monthly cap {cap} reached mid-pair")
+    log_call(conn)
+    inb = _query_cheapest(ret_from, origin, return_date)
+    if inb is None:
+        return None
+    return outb + inb
 
 
-def alerted_recently(conn, trip_id, hours=24):
+# ─── Date generation ────────────────────────────────────────────────────────
+
+def generate_pairs(trip):
+    """Yield all (depart, return) ISO-date strings covering trip's window."""
+    start = date.fromisoformat(str(trip["window_start"]))
+    end = date.fromisoformat(str(trip["window_end"]))
+    duration = int(trip["duration_days"])
+    d = start
+    while d <= end:
+        ret = d + timedelta(days=duration - 1)
+        yield d.isoformat(), ret.isoformat()
+        d += timedelta(days=1)
+
+
+def in_watch_window(trip, today):
+    plan = date.fromisoformat(str(trip["planned_depart"]))
+    days_out = (plan - today).days
+    low, high = trip["watch_days_before"]
+    return low <= days_out <= high
+
+
+# ─── Dedup ──────────────────────────────────────────────────────────────────
+
+def alerted_recently(conn, trip_id, depart, hours=24):
     cutoff = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
-    cur = conn.execute(
-        "SELECT 1 FROM alerts_sent WHERE trip_id = ? AND sent_at >= ?",
-        (trip_id, cutoff),
-    )
-    return cur.fetchone() is not None
+    return conn.execute(
+        "SELECT 1 FROM alerts_sent WHERE trip_id = ? AND depart_date = ? AND sent_at >= ?",
+        (trip_id, depart, cutoff),
+    ).fetchone() is not None
 
+
+def mark_alert(conn, trip_id, depart, price):
+    conn.execute(
+        "INSERT INTO alerts_sent (trip_id, depart_date, price_eur, sent_at) VALUES (?, ?, ?, ?)",
+        (trip_id, depart, price, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+
+
+# ─── Notify ─────────────────────────────────────────────────────────────────
 
 def gflights_url(origin, dest, depart, return_date=None):
     q = f"Flights from {origin} to {dest} on {depart}"
@@ -204,71 +241,146 @@ def notify_whatsapp(message):
     r.raise_for_status()
 
 
-def in_watch_window(trip, today):
-    depart = date.fromisoformat(str(trip["depart_window"][0]))
-    days_out = (depart - today).days
-    low, high = trip["watch_days_before"]
-    return low <= days_out <= high
+# ─── Scan modes ─────────────────────────────────────────────────────────────
+
+def _dow(iso_date):
+    return ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][
+        date.fromisoformat(iso_date).weekday()
+    ]
 
 
-def process_trip(conn, cap, origin, trip, today):
-    if not in_watch_window(trip, today):
-        return
-    depart = str(trip["depart_window"][0])
-    ret = str(trip["return_window"][0]) if trip.get("return_window") else None
+def full_scan_trip(conn, cap, origin, trip, top_n):
+    """Scan every (depart, return) pair in trip's window. Cache top-N, send digest."""
+    trip_id = trip["id"]
+    ret_from = trip.get("return_from") or trip["destinations"][0]
     dest = trip["destinations"][0]
-    ret_from = trip.get("return_from") or dest
+    plan_depart = str(trip["planned_depart"])
 
-    if ret_from == dest:
-        price = search_fare(conn, cap, origin, dest, depart, ret)
-        route = f"{origin}↔{dest}"
-    else:
-        outb = search_fare(conn, cap, origin, dest, depart)
-        inb = search_fare(conn, cap, ret_from, origin, ret) if ret else None
-        price = (outb + inb) if (outb and inb) else None
-        route = f"{origin}→{dest} / {ret_from}→{origin}"
+    results = []
+    for depart, ret in generate_pairs(trip):
+        price = search_pair(conn, cap, origin, dest, ret_from, depart, ret)
+        if price is None:
+            continue
+        results.append((depart, ret, price))
+        conn.execute(
+            "INSERT INTO fares (trip_id, depart_date, return_date, price_eur, scan_mode, seen_at) "
+            "VALUES (?, ?, ?, ?, 'full', ?)",
+            (trip_id, depart, ret, price, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
 
-    if price is None:
-        print(f"[{trip['id']}] no fares returned")
+    if not results:
+        print(f"[{trip_id}] full scan: no fares returned")
         return
 
+    # Compute top-N cheapest, rewrite top_dates cache
+    results.sort(key=lambda r: r[2])
+    top = results[:top_n]
+    conn.execute("DELETE FROM top_dates WHERE trip_id = ?", (trip_id,))
     now = datetime.utcnow().isoformat()
+    for depart, ret, price in top:
+        conn.execute(
+            "INSERT INTO top_dates (trip_id, depart_date, return_date, price_at_fullscan, computed_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (trip_id, depart, ret, price, now),
+        )
+    conn.commit()
+
+    # Plan-date price for comparison
+    plan_price = next((p for d, _, p in results if d == plan_depart), None)
+    prices_only = [p for _, _, p in results]
+    median = statistics.median(prices_only)
+
+    lines = [f"✈️ {trip['label']} — weekly scan"]
+    lines.append(f"Window: {trip['window_start']} → {trip['window_end']} ({len(results)} dates)")
+    lines.append(f"Median €{median:.0f}")
+    lines.append("")
+    lines.append("Cheapest 5:")
+    top5 = top[:5]
+    for depart, ret, price in top5:
+        tag = " 📌plan" if depart == plan_depart else ""
+        vs_plan = f" ({(1-price/plan_price)*100:+.0f}% vs plan)" if plan_price else ""
+        lines.append(f"  {_dow(depart)} {depart}: €{price:.0f}{tag}{vs_plan}")
+    # Always include plan date — show it below the top 5 if not already there
+    if plan_price and not any(d == plan_depart for d, _, _ in top5):
+        lines.append("")
+        lines.append(f"Your plan: {_dow(plan_depart)} {plan_depart}: €{plan_price:.0f}")
+    elif not plan_price:
+        lines.append("")
+        lines.append(f"Your plan: {_dow(plan_depart)} {plan_depart}: (no fare returned)")
+    lines.append("")
+    lines.append(f"Book cheapest: {gflights_url(origin, dest, top[0][0], top[0][1])}")
+
+    notify_whatsapp("\n".join(lines))
+    print(f"[{trip_id}] full scan done: {len(results)} dates, top €{top[0][2]:.0f}, digest sent")
+
+
+def watch_scan_trip(conn, cap, origin, trip):
+    """Re-check only the top-N dates from latest full scan. Alert on drop."""
+    trip_id = trip["id"]
+    ret_from = trip.get("return_from") or trip["destinations"][0]
+    dest = trip["destinations"][0]
+    threshold = trip.get("baseline_discount_pct", 20)
+
+    rows = conn.execute(
+        "SELECT depart_date, return_date, price_at_fullscan FROM top_dates "
+        "WHERE trip_id = ? ORDER BY price_at_fullscan ASC",
+        (trip_id,),
+    ).fetchall()
+
+    if not rows:
+        print(f"[{trip_id}] watch: no cached top_dates yet (needs a full scan first)")
+        return
+
+    drops = []
+    for depart, ret, prev_price in rows:
+        new_price = search_pair(conn, cap, origin, dest, ret_from, depart, ret)
+        if new_price is None:
+            continue
+        conn.execute(
+            "INSERT INTO fares (trip_id, depart_date, return_date, price_eur, scan_mode, seen_at) "
+            "VALUES (?, ?, ?, ?, 'watch', ?)",
+            (trip_id, depart, ret, new_price, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        drop_pct = (1 - new_price / prev_price) * 100 if prev_price > 0 else 0
+        print(f"[{trip_id}] {depart}: €{new_price:.0f} (was €{prev_price:.0f}, {drop_pct:+.0f}%)")
+        if drop_pct >= threshold:
+            drops.append((depart, ret, prev_price, new_price, drop_pct))
+
+    for depart, ret, prev, new, pct in drops:
+        if alerted_recently(conn, trip_id, depart):
+            print(f"[{trip_id}] drop on {depart} already alerted recently")
+            continue
+        msg = (
+            f"🔥 DEAL — {trip['label']}\n"
+            f"{_dow(depart)} {depart} → {_dow(ret)} {ret}\n"
+            f"€{new:.0f} (was €{prev:.0f}, −{pct:.0f}%)\n"
+            f"Book: {gflights_url(origin, dest, depart, ret)}"
+        )
+        notify_whatsapp(msg)
+        mark_alert(conn, trip_id, depart, new)
+        print(f"[{trip_id}] ✅ alert sent for {depart}")
+
+
+# ─── Budget ─────────────────────────────────────────────────────────────────
+
+def budget_alert_sent(conn, month, level):
+    return conn.execute(
+        "SELECT 1 FROM budget_alerts WHERE month = ? AND level = ?", (month, level)
+    ).fetchone() is not None
+
+
+def mark_budget_alert(conn, month, level):
     conn.execute(
-        "INSERT INTO fares (trip_id, origin, dest, depart_date, return_date, price_eur, seen_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (trip["id"], origin, dest, depart, ret, price, now),
+        "INSERT OR REPLACE INTO budget_alerts (month, level, sent_at) VALUES (?, ?, ?)",
+        (month, level, datetime.utcnow().isoformat()),
     )
     conn.commit()
 
-    base = rolling_baseline(conn, trip["id"])
-    threshold = trip.get("baseline_discount_pct", 20)
-    if base:
-        print(f"[{trip['id']}] €{price:.0f} vs baseline €{base:.0f} ({(1-price/base)*100:+.0f}%)")
-    else:
-        print(f"[{trip['id']}] €{price:.0f} (no baseline yet)")
-
-    if base and price <= base * (1 - threshold / 100):
-        if alerted_recently(conn, trip["id"]):
-            print("  (alert sent in last 24h — skipping)")
-            return
-        url = gflights_url(origin, dest, depart, ret)
-        msg = (
-            f"✈️ DEAL — {trip['label']}\n"
-            f"{route} {depart}" + (f" → {ret}" if ret else "") + "\n"
-            f"Now: €{price:.0f} (baseline €{base:.0f}, -{(1-price/base)*100:.0f}%)\n"
-            f"Book: {url}"
-        )
-        notify_whatsapp(msg)
-        conn.execute(
-            "INSERT INTO alerts_sent (trip_id, price_eur, sent_at) VALUES (?, ?, ?)",
-            (trip["id"], price, now),
-        )
-        conn.commit()
-        print("  ✅ ALERT SENT")
-
 
 def check_budget(conn, cfg):
-    cap = cfg.get("monthly_request_cap", 1800)
+    cap = cfg.get("monthly_request_cap", 10000)
     warn_pct = cfg.get("warn_at_pct", 80)
     stop_pct = cfg.get("stop_at_pct", 90)
     used = calls_this_month(conn)
@@ -278,40 +390,51 @@ def check_budget(conn, cfg):
 
     if pct >= stop_pct and not budget_alert_sent(conn, month, "stop"):
         notify_whatsapp(
-            f"🛑 Flight watcher STOPPED — call budget {pct:.0f}% ({used}/{cap}) "
-            f"for {month}. No more lookups until next month."
+            f"🛑 Watcher STOPPED — scrape count {pct:.0f}% ({used}/{cap}) for {month}."
         )
         mark_budget_alert(conn, month, "stop")
     elif pct >= warn_pct and not budget_alert_sent(conn, month, "warn"):
         notify_whatsapp(
-            f"⚠️ Flight watcher at {pct:.0f}% of monthly call budget "
-            f"({used}/{cap}) for {month}. Will auto-stop at {stop_pct}%."
+            f"⚠️ Watcher at {pct:.0f}% of monthly scrape budget ({used}/{cap}) for {month}."
         )
         mark_budget_alert(conn, month, "warn")
 
     return cap if pct < stop_pct else 0
 
 
+# ─── Main ───────────────────────────────────────────────────────────────────
+
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["full", "watch"], default="watch")
+    args = parser.parse_args()
+
     cfg = load_config()
     conn = init_db()
     today = date.today()
-    print(f"=== Flight watcher run {today} ===")
+    top_n = cfg.get("default_top_n_watch", 5)
+    print(f"=== Watcher run {today} mode={args.mode} ===")
 
-    effective_cap = check_budget(conn, cfg)
-    if effective_cap == 0:
-        print("Hard-stop in effect — skipping all trip checks this run.")
+    cap = check_budget(conn, cfg)
+    if cap == 0:
+        print("Hard-stop — skipping all trips.")
         conn.close()
         return
 
     for trip in cfg["trips"]:
+        if not in_watch_window(trip, today):
+            continue
         try:
-            process_trip(conn, effective_cap, cfg["origin"], trip, today)
+            if args.mode == "full":
+                full_scan_trip(conn, cap, cfg["origin"], trip, top_n)
+            else:
+                watch_scan_trip(conn, cap, cfg["origin"], trip)
         except BudgetExceeded as e:
-            print(f"BUDGET: {e} — stopping run.")
+            print(f"BUDGET: {e} — stopping.")
             break
         except Exception as e:
             print(f"[{trip['id']}] ERROR: {e}", file=sys.stderr)
+
     conn.close()
 
 

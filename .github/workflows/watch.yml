@@ -2,23 +2,25 @@ name: watch
 
 on:
   schedule:
-    - cron: "0 */6 * * *"   # every 6 hours
+    - cron: "0 2 * * *"      # daily 02:00 UTC → watch mode (quick scan of cached top dates)
+    - cron: "30 2 * * 0"     # Sundays 02:30 UTC → full mode (every date in every window)
   workflow_dispatch:
     inputs:
       mode:
         description: "Run mode"
         required: true
-        default: "normal"
+        default: "watch"
         type: choice
         options:
-          - normal
+          - watch
+          - full
           - test
 
 permissions:
-  contents: write            # needed to commit fares.db back
+  contents: write
 
 jobs:
-  watch:
+  run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,25 +32,39 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - name: Run watcher (normal mode)
-        if: github.event_name == 'schedule' || inputs.mode == 'normal'
+      - name: Determine mode
+        id: pick
+        env:
+          SCHEDULE: ${{ github.event.schedule }}
+          DISPATCH_MODE: ${{ inputs.mode }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "mode=$DISPATCH_MODE" >> "$GITHUB_OUTPUT"
+          elif [ "$SCHEDULE" = "30 2 * * 0" ]; then
+            echo "mode=full" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=watch" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run watcher (full / watch)
+        if: steps.pick.outputs.mode == 'full' || steps.pick.outputs.mode == 'watch'
         env:
           CMB_PHONE: ${{ secrets.CMB_PHONE }}
           CMB_KEY: ${{ secrets.CMB_KEY }}
-        run: python watcher.py
+        run: python watcher.py --mode ${{ steps.pick.outputs.mode }}
 
-      - name: Run watcher (test mode — forces WhatsApp regardless of thresholds)
-        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'test'
+      - name: Run test preview
+        if: steps.pick.outputs.mode == 'test'
         env:
           CMB_PHONE: ${{ secrets.CMB_PHONE }}
           CMB_KEY: ${{ secrets.CMB_KEY }}
         run: python test_run.py
 
-      - name: Persist fare history
-        if: github.event_name == 'schedule' || inputs.mode == 'normal'
+      - name: Persist fares.db
+        if: steps.pick.outputs.mode != 'test'
         run: |
           git config user.name "watcher-bot"
           git config user.email "bot@users.noreply.github.com"
           git add fares.db
-          git diff --cached --quiet || git commit -m "fare update $(date -u +%FT%TZ)"
+          git diff --cached --quiet || git commit -m "fare update $(date -u +%FT%TZ) [${{ steps.pick.outputs.mode }}]"
           git push

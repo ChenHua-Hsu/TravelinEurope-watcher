@@ -10,9 +10,11 @@ Modes:
 """
 import argparse
 import os
+import random
 import sqlite3
 import statistics
 import sys
+import time
 import urllib.parse
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -23,6 +25,12 @@ from fast_flights import FlightQuery, Passengers, create_query, get_flights
 from fast_flights import fetcher as _ff_fetcher
 from fast_flights.fetcher import Client as _FFClient, URL as _FF_URL
 from fast_flights.querying import Query as _FFQuery
+try:
+    from fast_flights import FlightsNotFound as _FFNotFound
+except ImportError:
+    _FFNotFound = type("FlightsNotFound", (Exception,), {})
+
+INTER_CALL_SLEEP = 1.5  # seconds between google requests — avoid IP throttling
 
 # EU GDPR consent-wall bypass: preseeded cookie so European IPs don't get the consent page.
 _CONSENT_COOKIES = {"CONSENT": "YES+cb", "SOCS": "CAISHAgBEhJnd3NfMjAyNDAxMDQtMF9SQzIaAmVuIAEaBgiA_LyvBg"}
@@ -58,6 +66,12 @@ def load_config():
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
+    # Migrate stale v1 schema if present (old columns: origin, dest).
+    cur = conn.execute("PRAGMA table_info(fares)")
+    existing_cols = {row[1] for row in cur.fetchall()}
+    if existing_cols and ("scan_mode" not in existing_cols or "origin" in existing_cols):
+        print(f"Migrating stale fares schema (had cols: {sorted(existing_cols)})")
+        conn.execute("DROP TABLE fares")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS fares (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -131,29 +145,43 @@ def _parse_price(p):
         return None
 
 
-def _query_cheapest(from_a, to_a, dep_date, return_date=None):
+def _query_cheapest(from_a, to_a, dep_date, return_date=None, retries=1):
     """One Google Flights query. Returns min price or None."""
     flights = [FlightQuery(date=dep_date, from_airport=from_a, to_airport=to_a)]
     trip_type = "one-way"
     if return_date:
         flights.append(FlightQuery(date=return_date, from_airport=to_a, to_airport=from_a))
         trip_type = "round-trip"
-    try:
-        q = create_query(
-            flights=flights,
-            trip=trip_type,
-            seat="economy",
-            passengers=Passengers(adults=1),
-            currency="EUR",
-        )
-        result = get_flights(q)
-        items = getattr(result, "flights", None) or list(result or [])
-        prices = [_parse_price(getattr(f, "price", None)) for f in items]
-        prices = [p for p in prices if p is not None]
-        return min(prices) if prices else None
-    except Exception as e:
-        print(f"  gflights error {from_a}→{to_a} {dep_date}: {e}", file=sys.stderr)
-        return None
+
+    attempt = 0
+    while attempt <= retries:
+        attempt += 1
+        try:
+            q = create_query(
+                flights=flights,
+                trip=trip_type,
+                seat="economy",
+                passengers=Passengers(adults=1),
+                currency="EUR",
+            )
+            result = get_flights(q)
+            items = getattr(result, "flights", None) or list(result or [])
+            prices = [_parse_price(getattr(f, "price", None)) for f in items]
+            prices = [p for p in prices if p is not None]
+            if prices:
+                return min(prices)
+            # No prices and no exception → genuinely no fares
+            return None
+        except _FFNotFound:
+            return None  # not an error — just empty
+        except Exception as e:
+            if attempt > retries:
+                print(f"  gflights error {from_a}→{to_a} {dep_date} ({type(e).__name__}): {e}", file=sys.stderr)
+                return None
+            # Back off and retry
+            time.sleep(2 + random.random() * 2)
+
+    return None
 
 
 def search_pair(conn, cap, origin, dest, ret_from, depart, return_date):
@@ -164,17 +192,21 @@ def search_pair(conn, cap, origin, dest, ret_from, depart, return_date):
 
     if ret_from == dest:
         log_call(conn)
-        return _query_cheapest(origin, dest, depart, return_date)
+        price = _query_cheapest(origin, dest, depart, return_date)
+        time.sleep(INTER_CALL_SLEEP)
+        return price
 
     # Open-jaw: two one-ways summed
     log_call(conn)
     outb = _query_cheapest(origin, dest, depart)
+    time.sleep(INTER_CALL_SLEEP)
     if outb is None:
         return None
     if calls_this_month(conn) >= cap:
         raise BudgetExceeded(f"monthly cap {cap} reached mid-pair")
     log_call(conn)
     inb = _query_cheapest(ret_from, origin, return_date)
+    time.sleep(INTER_CALL_SLEEP)
     if inb is None:
         return None
     return outb + inb
@@ -299,7 +331,14 @@ def full_scan_trip(conn, cap, origin, trip, top_n):
     top5 = top[:5]
     for depart, ret, price in top5:
         tag = " 📌plan" if depart == plan_depart else ""
-        vs_plan = f" ({(1-price/plan_price)*100:+.0f}% vs plan)" if plan_price else ""
+        if plan_price and depart != plan_depart:
+            delta = price - plan_price
+            if delta < 0:
+                vs_plan = f" (save €{-delta:.0f})"
+            else:
+                vs_plan = f" (+€{delta:.0f})"
+        else:
+            vs_plan = ""
         lines.append(f"  {_dow(depart)} {depart}: €{price:.0f}{tag}{vs_plan}")
     # Always include plan date — show it below the top 5 if not already there
     if plan_price and not any(d == plan_depart for d, _, _ in top5):

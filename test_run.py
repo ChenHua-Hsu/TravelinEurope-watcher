@@ -1,35 +1,24 @@
 #!/usr/bin/env python3
-"""One-shot test: picks 5 trips, scans a FEW dates in each window (not full),
-sends a single WhatsApp preview. Does not touch dedup / baseline state.
-
-Run via GitHub Actions: workflow_dispatch → mode: test
+"""Test mode: picks 5 trips, runs a mini full_scan on each, sends ONE combined WhatsApp.
+Does NOT touch dedup state.
 """
 import os
 import sys
-from datetime import date, timedelta
 from pathlib import Path
-
 import yaml
 
 from watcher import (
-    search_pair,
-    notify_whatsapp,
-    init_db,
-    gflights_url,
-    generate_pairs,
-    _dow,
+    _scan_trip_all_dates, init_db, notify_whatsapp, _dow,
 )
 
-# Pick 5 trips to test — mix of near-term and far-out.
 TEST_TRIP_IDS = [
-    "italy_2026_11",
+    "italy_2028_03",
     "czech_hungary_2026_12",
-    "iceland_2027_01",
+    "iceland_2028_01",
     "spain_2026_10",
     "croatia_2027_09",
+    "finland_2027_03",
 ]
-# Max dates to probe per trip in test mode (keep cheap)
-TEST_MAX_DATES_PER_TRIP = 5
 
 
 def main():
@@ -40,7 +29,7 @@ def main():
     cfg = yaml.safe_load(Path("trips.yaml").read_text())
     origin = cfg["origin"]
     conn = init_db()
-    cap = 999_999  # no safety cap for test
+    cap = 999_999
 
     trips_by_id = {t["id"]: t for t in cfg["trips"]}
     lines = ["✈️ TravelinEurope watcher — test run", ""]
@@ -50,47 +39,26 @@ def main():
         if not trip:
             lines.append(f"❌ {tid}: not in trips.yaml")
             continue
-
-        dest = trip["destinations"][0]
-        ret_from = trip.get("return_from") or dest
         print(f"\n--- {trip['label']} ---")
-
-        # Sample a few evenly spaced dates in the window (not full scan)
-        pairs = list(generate_pairs(trip))
-        if len(pairs) > TEST_MAX_DATES_PER_TRIP:
-            step = len(pairs) // TEST_MAX_DATES_PER_TRIP
-            pairs = pairs[::step][:TEST_MAX_DATES_PER_TRIP]
-
-        results = []
-        for depart, ret in pairs:
-            try:
-                price = search_pair(conn, cap, origin, dest, ret_from, depart, ret)
-            except Exception as e:
-                print(f"  {depart}: error {e}")
-                continue
-            if price is None:
-                print(f"  {depart}: no fares")
-                continue
-            results.append((depart, ret, price))
-            print(f"  {_dow(depart)} {depart}: €{price:.0f}")
-
-        if not results:
-            lines.append(f"⚠️ {trip['label']}: no fares returned for any sampled date")
+        try:
+            pairs = _scan_trip_all_dates(conn, cap, origin, trip)
+        except Exception as e:
+            lines.append(f"❌ {trip['label']}: {e}")
             continue
-
-        results.sort(key=lambda r: r[2])
-        best_depart, best_ret, best_price = results[0]
+        if not pairs:
+            lines.append(f"⚠️ {trip['label']}: no fares returned")
+            continue
+        pairs.sort(key=lambda r: r[2])
+        best_d, _, best_p = pairs[0]
         plan = str(trip["planned_depart"])
-        plan_price = next((p for d, _, p in results if d == plan), None)
-
-        line = f"✅ {trip['label']}: cheapest {_dow(best_depart)} {best_depart} €{best_price:.0f}"
-        if plan_price:
-            delta = (1 - best_price / plan_price) * 100
-            line += f" (plan {plan} €{plan_price:.0f}, {delta:+.0f}% vs cheapest)"
+        plan_p = next((p for d, _, p in pairs if d == plan), None)
+        line = f"✅ {trip['label']}: cheapest {_dow(best_d)} {best_d} €{best_p:.0f}"
+        if plan_p and best_d != plan:
+            line += f" (plan €{plan_p:.0f}, save €{plan_p - best_p:.0f})"
         lines.append(line)
+        print(f"  → cheapest: {best_d} €{best_p:.0f}")
 
     conn.close()
-
     msg = "\n".join(lines)
     print("\n--- Sending WhatsApp ---")
     print(msg)

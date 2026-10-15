@@ -41,7 +41,7 @@ def main():
             continue
         print(f"\n--- {trip['label']} ---")
         try:
-            pairs = _scan_trip_all_dates(conn, cap, origin, trip)
+            pairs = _scan_trip_all_dates(conn, cap, origin, trip, cfg)
         except Exception as e:
             lines.append(f"❌ {trip['label']}: {e}")
             continue

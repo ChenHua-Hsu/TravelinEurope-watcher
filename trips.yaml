@@ -22,6 +22,12 @@ stop_at_pct: 90
 # Number of cheapest dates per trip to monitor between weekly full scans.
 default_top_n_watch: 5
 
+# For each trip, also scan combinations that extend the duration by 0, 1, 2 days.
+# e.g. a 5-day trip is also checked at 6 and 7 days. Lets you catch deals that
+# require staying an extra night. Set to 0 per-trip to disable (e.g. for locked
+# calendar-tied trips like Christmas / NYE where duration can't be flexed).
+default_duration_flex_days: 2
+
 trips:
   # ============ YEAR 1 ============
   - id: austria_slovakia_slovenia_2026_09

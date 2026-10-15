@@ -64,6 +64,17 @@ def init_db():
             seen_at TEXT NOT NULL
         )
     """)
+    # top_dates PK now includes return_date so same depart with different
+    # duration (different returns) can coexist.
+    cur = conn.execute("PRAGMA table_info(top_dates)")
+    td_cols = {row[1] for row in cur.fetchall()}
+    if td_cols:
+        # Check PK by trying a dummy conflict insert — easier: just drop + recreate
+        cur = conn.execute("SELECT sql FROM sqlite_master WHERE name='top_dates'")
+        sql_def = (cur.fetchone() or [""])[0] or ""
+        if "PRIMARY KEY (trip_id, depart_date, return_date)" not in sql_def:
+            print("Migrating top_dates schema to include return_date in PK")
+            conn.execute("DROP TABLE top_dates")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS top_dates (
             trip_id TEXT NOT NULL,
@@ -71,7 +82,7 @@ def init_db():
             return_date TEXT NOT NULL,
             price_at_fullscan REAL NOT NULL,
             computed_at TEXT NOT NULL,
-            PRIMARY KEY (trip_id, depart_date)
+            PRIMARY KEY (trip_id, depart_date, return_date)
         )
     """)
     conn.execute("""
@@ -172,16 +183,25 @@ def search_leg_dates(conn, cap, from_code, to_code, date_from, date_to, retries=
 
 # ─── Date generation ────────────────────────────────────────────────────────
 
-def generate_pairs(trip):
-    """Yield all (depart, return) ISO-date strings covering trip's window."""
+def _duration_options(trip, cfg):
+    """Return list of durations to try: [base, base+1, ..., base+flex]."""
+    base = int(trip["duration_days"])
+    flex = int(trip.get("duration_flex_days", cfg.get("default_duration_flex_days", 2)))
+    return [base + i for i in range(flex + 1)]
+
+
+def generate_pairs(trip, cfg=None):
+    """Yield all (depart, return) ISO-date strings covering trip's window,
+    across all duration options (base, base+1, ..., base+flex)."""
+    cfg = cfg or {}
     start = date.fromisoformat(str(trip["window_start"]))
     end = date.fromisoformat(str(trip["window_end"]))
-    duration = int(trip["duration_days"])
-    d = start
-    while d <= end:
-        ret = d + timedelta(days=duration - 1)
-        yield d.isoformat(), ret.isoformat()
-        d += timedelta(days=1)
+    for duration in _duration_options(trip, cfg):
+        d = start
+        while d <= end:
+            ret = d + timedelta(days=duration - 1)
+            yield d.isoformat(), ret.isoformat()
+            d += timedelta(days=1)
 
 
 def in_watch_window(trip, today):
@@ -236,45 +256,57 @@ def _dow(iso_date):
     ]
 
 
-def _build_pair_prices(trip, origin, out_prices, in_prices):
-    """Combine outbound and inbound date-price dicts into (depart, return, total)."""
-    duration = int(trip["duration_days"])
+def _dur_days(depart_iso, return_iso):
+    """Return inclusive duration in days: a round-trip Thu→Mon = 5 days."""
+    return (date.fromisoformat(return_iso) - date.fromisoformat(depart_iso)).days + 1
+
+
+def _build_pair_prices(trip, cfg, out_prices, in_prices):
+    """Combine outbound and inbound date-price dicts into (depart, return, total).
+    Yields pairs across all duration options."""
     pairs = []
-    for depart_iso, out_price in out_prices.items():
-        ret_date = date.fromisoformat(depart_iso) + timedelta(days=duration - 1)
-        ret_iso = ret_date.isoformat()
-        in_price = in_prices.get(ret_iso)
-        if in_price is None:
-            continue
-        pairs.append((depart_iso, ret_iso, out_price + in_price))
+    for duration in _duration_options(trip, cfg):
+        for depart_iso, out_price in out_prices.items():
+            ret_date = date.fromisoformat(depart_iso) + timedelta(days=duration - 1)
+            ret_iso = ret_date.isoformat()
+            in_price = in_prices.get(ret_iso)
+            if in_price is None:
+                continue
+            pairs.append((depart_iso, ret_iso, out_price + in_price))
     return pairs
 
 
-def _scan_trip_all_dates(conn, cap, origin, trip):
+def _scan_trip_all_dates(conn, cap, origin, trip, cfg=None):
     """Shared helper: do 2 SearchDates calls (outbound, inbound) → list of
-    (depart_iso, return_iso, total_price). Round-trip collapses to same airport."""
+    (depart_iso, return_iso, total_price). Covers all duration options."""
+    cfg = cfg or {}
     dest = trip["destinations"][0]
     ret_from = trip.get("return_from") or dest
-    duration = int(trip["duration_days"])
+    durations = _duration_options(trip, cfg)
+    min_dur, max_dur = min(durations), max(durations)
 
     out_from = str(trip["window_start"])
     out_to = str(trip["window_end"])
-    in_from = (date.fromisoformat(out_from) + timedelta(days=duration - 1)).isoformat()
-    in_to = (date.fromisoformat(out_to) + timedelta(days=duration - 1)).isoformat()
+    # inbound range covers the shortest-duration earliest return through the
+    # longest-duration latest return, so one SearchDates covers all variants.
+    in_from = (date.fromisoformat(out_from) + timedelta(days=min_dur - 1)).isoformat()
+    in_to = (date.fromisoformat(out_to) + timedelta(days=max_dur - 1)).isoformat()
 
     out_prices = search_leg_dates(conn, cap, origin, dest, out_from, out_to)
     time.sleep(INTER_CALL_SLEEP)
     in_prices = search_leg_dates(conn, cap, ret_from, origin, in_from, in_to)
-    return _build_pair_prices(trip, origin, out_prices, in_prices)
+    return _build_pair_prices(trip, cfg, out_prices, in_prices)
 
 
-def full_scan_trip(conn, cap, origin, trip, top_n):
+def full_scan_trip(conn, cap, origin, trip, top_n, cfg=None):
     """Full scan of trip's window — cache top-N, send weekly digest."""
+    cfg = cfg or {}
     trip_id = trip["id"]
     dest = trip["destinations"][0]
     plan_depart = str(trip["planned_depart"])
+    plan_duration = int(trip["duration_days"])
 
-    pairs = _scan_trip_all_dates(conn, cap, origin, trip)
+    pairs = _scan_trip_all_dates(conn, cap, origin, trip, cfg)
     if not pairs:
         print(f"[{trip_id}] full scan: no fares returned")
         return
@@ -298,29 +330,42 @@ def full_scan_trip(conn, cap, origin, trip, top_n):
         )
     conn.commit()
 
-    plan_price = next((p for d, _, p in pairs if d == plan_depart), None)
+    # "Plan" = cheapest pair matching user's planned depart AND planned duration.
+    def _is_plan(depart, ret):
+        return depart == plan_depart and _dur_days(depart, ret) == plan_duration
+
+    plan_price = next((p for d, r, p in pairs if _is_plan(d, r)), None)
     prices_only = [p for _, _, p in pairs]
     median = statistics.median(prices_only)
 
     lines = [f"✈️ {trip['label']} — weekly scan"]
-    lines.append(f"Window: {trip['window_start']} → {trip['window_end']} ({len(pairs)} dates)")
+    lines.append(
+        f"Window: {trip['window_start']} → {trip['window_end']} "
+        f"({len(pairs)} depart×duration combos)"
+    )
     lines.append(f"Median €{median:.0f}")
     lines.append("")
     lines.append("Cheapest 5:")
     for depart, ret, price in top[:5]:
-        tag = " 📌plan" if depart == plan_depart else ""
-        if plan_price and depart != plan_depart:
+        d_days = _dur_days(depart, ret)
+        tag = " 📌plan" if _is_plan(depart, ret) else ""
+        if plan_price and not _is_plan(depart, ret):
             delta = price - plan_price
-            if delta < 0:
-                vs_plan = f" (save €{-delta:.0f})"
-            else:
-                vs_plan = f" (+€{delta:.0f})"
+            vs_plan = f" (save €{-delta:.0f})" if delta < 0 else f" (+€{delta:.0f})"
         else:
             vs_plan = ""
-        lines.append(f"  {_dow(depart)} {depart}: €{price:.0f}{tag}{vs_plan}")
-    if plan_price and not any(d == plan_depart for d, _, _ in top[:5]):
-        lines.append("")
-        lines.append(f"Your plan: {_dow(plan_depart)} {plan_depart}: €{plan_price:.0f}")
+        lines.append(
+            f"  {_dow(depart)} {depart} → {_dow(ret)} {ret} ({d_days}d)"
+            f": €{price:.0f}{tag}{vs_plan}"
+        )
+    if plan_price and not any(_is_plan(d, r) for d, r, _ in top[:5]):
+        plan_pair = next(((d, r) for d, r, _ in pairs if _is_plan(d, r)), None)
+        if plan_pair:
+            d, r = plan_pair
+            lines.append("")
+            lines.append(
+                f"Your plan: {_dow(d)} {d} → {_dow(r)} {r} ({plan_duration}d): €{plan_price:.0f}"
+            )
     elif not plan_price:
         lines.append("")
         lines.append(f"Your plan: {_dow(plan_depart)} {plan_depart}: (no fare returned)")
@@ -331,8 +376,9 @@ def full_scan_trip(conn, cap, origin, trip, top_n):
     print(f"[{trip_id}] full scan done: {len(pairs)} dates, top €{top[0][2]:.0f}, digest sent")
 
 
-def watch_scan_trip(conn, cap, origin, trip):
+def watch_scan_trip(conn, cap, origin, trip, cfg=None):
     """Re-fetch today's prices for cached top-N dates; alert on drops."""
+    cfg = cfg or {}
     trip_id = trip["id"]
     dest = trip["destinations"][0]
     threshold = trip.get("baseline_discount_pct", 20)
@@ -346,25 +392,14 @@ def watch_scan_trip(conn, cap, origin, trip):
         print(f"[{trip_id}] watch: no cached top_dates yet (needs a full scan first)")
         return
 
-    # Build fresh pair prices covering just these cached dates.
-    # Simplest: redo a focused scan on the min/max of cached dates.
-    cached_departs = [r[0] for r in rows]
-    out_from = min(cached_departs)
-    out_to = max(cached_departs)
-    # To match the inbound dates we need a window too
-    duration = int(trip["duration_days"])
-    in_from = (date.fromisoformat(out_from) + timedelta(days=duration - 1)).isoformat()
-    in_to = (date.fromisoformat(out_to) + timedelta(days=duration - 1)).isoformat()
-
-    ret_from_code = trip.get("return_from") or dest
-    out_prices = search_leg_dates(conn, cap, origin, dest, out_from, out_to)
-    time.sleep(INTER_CALL_SLEEP)
-    in_prices = search_leg_dates(conn, cap, ret_from_code, origin, in_from, in_to)
-    fresh = {d: p for d, _, p in _build_pair_prices(trip, origin, out_prices, in_prices)}
+    # Rescan the whole trip (cheap: 2 SearchDates calls) so we have all duration
+    # variants fresh, then just extract the cached (depart, return) pairs.
+    all_pairs = _scan_trip_all_dates(conn, cap, origin, trip, cfg)
+    fresh = {(d, r): p for d, r, p in all_pairs}
 
     drops = []
     for depart, ret, prev_price in rows:
-        new_price = fresh.get(depart)
+        new_price = fresh.get((depart, ret))
         if new_price is None:
             continue
         conn.execute(
@@ -454,9 +489,9 @@ def main():
         first = False
         try:
             if args.mode == "full":
-                full_scan_trip(conn, cap, cfg["origin"], trip, top_n)
+                full_scan_trip(conn, cap, cfg["origin"], trip, top_n, cfg)
             else:
-                watch_scan_trip(conn, cap, cfg["origin"], trip)
+                watch_scan_trip(conn, cap, cfg["origin"], trip, cfg)
         except BudgetExceeded as e:
             print(f"BUDGET: {e} — stopping.")
             break

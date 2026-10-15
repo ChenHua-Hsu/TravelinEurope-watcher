@@ -32,6 +32,11 @@ except ImportError:
 
 INTER_CALL_SLEEP = 1.5  # seconds between google requests — avoid IP throttling
 
+# fast-flights only parses the "Best" section of Google's results, which excludes
+# budget carriers. Running a second query filtered to these airlines surfaces them.
+BUDGET_AIRLINES = ["U2", "FR", "W6", "VY", "V7", "EW", "LS"]
+# easyJet, Ryanair, Wizz, Vueling, Volotea, Eurowings, Jet2
+
 # EU GDPR consent-wall bypass: preseeded cookie so European IPs don't get the consent page.
 _CONSENT_COOKIES = {"CONSENT": "YES+cb", "SOCS": "CAISHAgBEhJnd3NfMjAyNDAxMDQtMF9SQzIaAmVuIAEaBgiA_LyvBg"}
 
@@ -145,12 +150,13 @@ def _parse_price(p):
         return None
 
 
-def _query_cheapest(from_a, to_a, dep_date, return_date=None, retries=1):
-    """One Google Flights query. Returns min price or None."""
-    flights = [FlightQuery(date=dep_date, from_airport=from_a, to_airport=to_a)]
+def _query_single(from_a, to_a, dep_date, return_date=None, airlines=None, retries=1):
+    """ONE Google Flights query (optionally airline-filtered). Returns min price or None."""
+    out_leg = FlightQuery(date=dep_date, from_airport=from_a, to_airport=to_a, airlines=airlines)
+    flights = [out_leg]
     trip_type = "one-way"
     if return_date:
-        flights.append(FlightQuery(date=return_date, from_airport=to_a, to_airport=from_a))
+        flights.append(FlightQuery(date=return_date, from_airport=to_a, to_airport=from_a, airlines=airlines))
         trip_type = "round-trip"
 
     attempt = 0
@@ -170,41 +176,56 @@ def _query_cheapest(from_a, to_a, dep_date, return_date=None, retries=1):
             prices = [p for p in prices if p is not None]
             if prices:
                 return min(prices)
-            # No prices and no exception → genuinely no fares
             return None
         except _FFNotFound:
-            return None  # not an error — just empty
+            return None
+        except TypeError:
+            # No results for this airline filter — treat as empty, not an error
+            return None
         except Exception as e:
             if attempt > retries:
-                print(f"  gflights error {from_a}→{to_a} {dep_date} ({type(e).__name__}): {e}", file=sys.stderr)
+                tag = f" (airlines={airlines})" if airlines else ""
+                print(f"  gflights error {from_a}→{to_a} {dep_date}{tag} ({type(e).__name__}): {e}", file=sys.stderr)
                 return None
-            # Back off and retry
             time.sleep(2 + random.random() * 2)
-
     return None
+
+
+def _query_cheapest(from_a, to_a, dep_date, return_date=None):
+    """Query default (big carriers) + budget filter, return min across both."""
+    results = []
+    p1 = _query_single(from_a, to_a, dep_date, return_date, airlines=None)
+    if p1 is not None:
+        results.append(p1)
+    time.sleep(INTER_CALL_SLEEP)
+    p2 = _query_single(from_a, to_a, dep_date, return_date, airlines=BUDGET_AIRLINES)
+    if p2 is not None:
+        results.append(p2)
+    return min(results) if results else None
 
 
 def search_pair(conn, cap, origin, dest, ret_from, depart, return_date):
     """Fetch cheapest total EUR fare for one (depart, return) pair.
-    Round-trip = 1 API call, open-jaw = 2 (fast-flights multi-city parser is broken)."""
+    Each _query_cheapest = 2 underlying HTTP calls (default + budget filter).
+    Round-trip = 2 real calls, open-jaw = 4."""
     if calls_this_month(conn) >= cap:
         raise BudgetExceeded(f"monthly cap {cap} reached")
 
     if ret_from == dest:
-        log_call(conn)
+        log_call(conn); log_call(conn)
         price = _query_cheapest(origin, dest, depart, return_date)
         time.sleep(INTER_CALL_SLEEP)
         return price
 
     # Open-jaw: two one-ways summed
-    log_call(conn)
+    log_call(conn); log_call(conn)
     outb = _query_cheapest(origin, dest, depart)
     time.sleep(INTER_CALL_SLEEP)
     if outb is None:
         return None
     if calls_this_month(conn) >= cap:
         raise BudgetExceeded(f"monthly cap {cap} reached mid-pair")
-    log_call(conn)
+    log_call(conn); log_call(conn)
     inb = _query_cheapest(ret_from, origin, return_date)
     time.sleep(INTER_CALL_SLEEP)
     if inb is None:
